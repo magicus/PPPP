@@ -15,7 +15,7 @@ console.log(options)
 const PPPP = require('./pppp')
 
 const p = new PPPP(options)
-const speaker = require('./speaker')
+//const speaker = require('./speaker')
 
 p.on('connected', (data) => {
   console.log('connected!', data)
@@ -26,8 +26,8 @@ p.on('connected', (data) => {
 })
 
 p.on('audioFrame', (audioFrame) => {
-  speaker.write(audioFrame.frame)
-  // console.log(audioFrame)
+  //speaker.write(audioFrame.frame)
+   console.log(audioFrame)
 })
 
 p.on('videoFrame', (videoFrame) => {
