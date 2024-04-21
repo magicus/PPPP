@@ -91,19 +91,21 @@ class PPPP extends EventEmitter {
     this.isConnected = false
     this.punchCount = 0
 
+    this.reconnectDelay = 500
+
     this.broadcastDestination=options.broadcastip,
     this.myIpAddressToBind=options.thisip
 
     this.socket.on('error', (err) => {
-      console.log(`socket error:\n${err.stack}`)
+      console.log(`closing socket! error:\n${err.stack}`)
       this.socket.close()
+      this.emit('error', (err))
     })
 
     this.socket.on('listening', () => {
       const address = this.socket.address()
       console.log(`socket listening ${address.address}:${address.port}`)
       this.socket.setBroadcast(true)
-
       this.sendBroadcast()
     })
 
@@ -114,8 +116,16 @@ class PPPP extends EventEmitter {
         this.socket.send(d, 3300, IP_DEBUG_MSG)
       }
 
-      let p = this.parsePacket(d)
-      this.handlePacket(p, msg, rinfo)
+      try {
+        let p = this.parsePacket(d)
+        try {
+          this.handlePacket(p, msg, rinfo)
+        } catch (e) {
+          console.error(`Error while handling packet: {e.message}`)
+        }
+      } catch (e) {
+        console.error(`Error while parsing packet: {e.message}`)
+      }
 
     })
 
@@ -132,13 +142,22 @@ class PPPP extends EventEmitter {
   }
 
   sendBroadcast() {
-    const message = Buffer.from('2cba5f5d', 'hex')
-
-    this.socket.send(message, 32108, this.broadcastDestination)
-    console.log('broadcast Message sent.')
-
-    if (!this.isConnected && this.punchCount == 0) {
-      setTimeout(this.sendBroadcast.bind(this), 100)
+    // if (!this.isConnected) {
+    //   this.emit('log', 'Trying to send broadcast while not connected! Aborting.')
+    //   return
+    // }
+    try {
+      const message = Buffer.from('2cba5f5d', 'hex')
+  
+      this.socket.send(message, 32108, this.broadcastDestination)
+      console.log('broadcast Message sent.')
+  
+      if (!this.isConnected && this.punchCount == 0) {
+        setTimeout(this.sendBroadcast.bind(this), this.reconnectDelay)
+        this.reconnectDelay += 1
+      }
+    } catch (e) {
+      this.emit('log', `Error while sending broadcast: ${e.message}`)
     }
   }
 
@@ -169,19 +188,20 @@ class PPPP extends EventEmitter {
 
   handlePacket(p, msg, rinfo) {
       //console.log(TYPE_DICT[p.type], p.size, p.channel, p.index)
+      let logmsg = ""
       if (p.type == MSG_DRW) {
-        this.emit(
-          'log',
-          `Received ${TYPE_DICT[p.type]} size: ${p.size} channel: ${
+        logmsg = `Received ${TYPE_DICT[p.type]} size: ${p.size} channel: ${
             p.channel
           } index: ${p.index}`
-        )
       } else {
-        this.emit('log', `Received ${TYPE_DICT[p.type]} size: ${p.size}`)
+        logmsg = `Received ${TYPE_DICT[p.type]} size: ${p.size}`
       }
+      // console.log(logmsg)
+      this.emit('debug', logmsg)
 
       //reply to MSG_PUNCH to establish connection
       if (p.type == MSG_PUNCH) {
+        console.log('MSG_PUNCH received')
         if (this.punchCount++ < 5) {
           this.socket.send(msg, rinfo.port, rinfo.address)
           this.emit('log', `Sent ${TYPE_DICT[MSG_PUNCH]}`)
@@ -189,22 +209,22 @@ class PPPP extends EventEmitter {
       }
 
       if (p.type == MSG_P2P_RDY) {
+        console.log('MSG_P2P_RDY received')
         this.IP_CAM = rinfo.address
         this.PORT_CAM = rinfo.port
 
         if (!this.isConnected) {
           this.isConnected = true
+          this.reconnectDelay = 500
           setTimeout(() => {
-            this.emit('connected', {
-              address: rinfo.address,
-              port: rinfo.port,
-            })
+            this.emit('connected', rinfo.address, rinfo.port)
           }, 500)
         }
       }
 
       // reply to MSG_ALIVE
       if (p.type == MSG_ALIVE) {
+        console.log('MSG_ALIVE received')
         let buf = Buffer.alloc(4)
         buf.writeUint8(MCAM, 0)
         buf.writeUInt8(MSG_ALIVE_ACK, 1)
@@ -217,6 +237,14 @@ class PPPP extends EventEmitter {
 
       // reply to MSG_CLOSE
       if (p.type == MSG_CLOSE) {
+        console.log('MSG_CLOSE received')
+        // wait 4 seconds and if connection is still down, reconnect
+        // setTimeout(function() {
+        if (this.isConnected) {
+          this.isConnected = false
+          this.emit('disconnected', this.IP_CAM, this.PORT_CAM)
+        }
+        // }, 3000, we);
         let buf = Buffer.alloc(4)
         buf.writeUint8(MCAM, 0)
         buf.writeUInt8(MSG_ALIVE, 1)
@@ -242,6 +270,7 @@ class PPPP extends EventEmitter {
 
       //handle MSG_DRW
       if (p.type == MSG_DRW) {
+        // console.log('MSG_DRW received')
         //send MSG_DRW_ACK
         let buf = Buffer.alloc(10)
         buf.writeUint8(MCAM, 0)
@@ -261,14 +290,18 @@ class PPPP extends EventEmitter {
         this.send(crypt.encrypt(buf).toString('hex'))
         this.send(crypt.encrypt(buf).toString('hex'))
         this.send(crypt.encrypt(buf).toString('hex'))
-        this.emit('log', `Sent ${TYPE_DICT[MSG_DRW_ACK]} x3`)
+        this.emit('debug', `Sent ${TYPE_DICT[MSG_DRW_ACK]} x3`)
 
 
         //handle CMD Response
         if (p.channel == 0) {
+          console.log('CMD Response received')
           if (0 == p.data.indexOf(Buffer.from('060a', 'hex'))) {
             let data = p.data.subarray(8)
-            this.emit('cmd', data.toString('ascii'))
+            let raw = data.toString('ascii')
+            let json = {}
+            try { json = JSON.parse(raw) } catch (e) { this.emit('log', `Error while parsing JSON: ${e.message}`) }
+            this.emit('cmd', json, raw)
           }
         }
 
@@ -336,7 +369,8 @@ class PPPP extends EventEmitter {
 
     data.copy(buf, 8)
     this.sendDRWPacket(0, buf)
-    this.emit('log', `CMD sent: ${data.toString('ascii')}`)
+    let __msg = `CMD sent: ${data.toString('ascii')}`;
+    this.emit('log', __msg)
   }
 
   sendDRWPacket(channel, data) {
@@ -348,15 +382,15 @@ class PPPP extends EventEmitter {
     buf.writeUInt8(channel, 5)
     buf.writeUInt16BE(this.DRW_PACKET_INDEX++, 6)
     data.copy(buf, 8)
-
     this.sendEnc(buf)
+    console.log('DRW packet sent (len: ' + buf.length + ')')
   }
 
   sendCommand(command, args) {
     let fixed_data = {
       user: 'admin',
       pwd: '6666',
-      devmac:'0000'
+      // devmac:'0000'
     }
   /* incorrect password:
   {
@@ -376,8 +410,8 @@ class PPPP extends EventEmitter {
       pro: CMD_DICT[command],
       cmd: command
     }
-
-    this.sendCMDPacket(JSON.stringify({ ...data, ...args, ...fixed_data}))
+    let strData = JSON.stringify({ ...data, ...args, ...fixed_data})
+    this.sendCMDPacket(strData)
   }
 
   sendCMDCheckUser() {
@@ -386,16 +420,19 @@ class PPPP extends EventEmitter {
 
   sendCMDrequestVideo1() {
     //"1080p" "HD" with 640x480
+    this.emit('log', 'requesting 640x480 video stream')
     this.sendCommand(CMD_STREAM, { video: 1 });
   }
 
   sendCMDrequestVideo2() {
     //"720p" "HD" with 320x240
+    this.emit('log', 'requesting 320x240 video stream')
     this.sendCommand(CMD_STREAM, { video: 2 });
   }
 
   sendCMDrequestAudio() {
     //Strange ADPCM format
+    this.emit('log', 'requesting ADPCM audio stream')
     this.sendCommand(CMD_STREAM, { audio: 1 });
   }
 
@@ -446,6 +483,10 @@ class PPPP extends EventEmitter {
 
   sendCMDIr(isOn) {
     this.sendCommand(CMD_DEV_CONTROL, { icut: isOn ? 1 : 0});
+  }
+
+  sendCMDLamp(isOn) {
+    this.sendCommand(CMD_DEV_CONTROL, { lamp: isOn ? 1 : 0});
   }
 
   sendCMDTalkSend() {
@@ -582,6 +623,13 @@ class PPPP extends EventEmitter {
     this.sendCommand(CMD_PTZ_CONTROL, { parms: 0, value: direction});
   }
 
+  sendCMDPtzStop() {
+    this.sendCommand(CMD_PTZ_CONTROL, { parms: 0, value: PTZ_PAN_LEFT_STOP});
+    this.sendCommand(CMD_PTZ_CONTROL, { parms: 0, value: PTZ_PAN_RIGHT_STOP});
+    this.sendCommand(CMD_PTZ_CONTROL, { parms: 0, value: PTZ_TILT_DOWN_STOP});
+    this.sendCommand(CMD_PTZ_CONTROL, { parms: 0, value: PTZ_TILT_UP_STOP});
+  }
+
   sendCMDPtzReset() {
     this.sendCommand(CMD_PTZ_CONTROL, { parms: 1, value: 132});
   }
@@ -665,6 +713,7 @@ class PPPP extends EventEmitter {
       this.sendEnc(Buffer.from([MCAM, MSG_CLOSE, 0, 0]))
       this.sendEnc(Buffer.from([MCAM, MSG_CLOSE, 0, 0]))
     }
+    this.socket.close()
   }
 }
 
